@@ -1,1 +1,215 @@
 version1.0
+// MakeFile
+all:object
+CC=g++
+CPPFLAGS=-Wall -std=c++11 -g
+LDFLAGS=-pthread -lpthread
+object:objectPool.o main.o
+	$(CC) $(LDFLAGS) -o $@ $^
+objectPool.o:objectPool.cc
+	$(CC) $(CPPFLAGS) -c $<
+main.o:main.cc
+	$(CC) $(CPPFLAGS) -c $<
+.PHONY:
+	clean
+clean:
+	rm -rf *.o object
+
+// object.h
+#ifndef OBJECT_POOL_H_
+#define OBJECT_POOL_H_
+
+#include <iostream>
+#include <string>
+#include <set>
+#include <vector>
+#include <memory>    // for shared_ptr
+#include <mutex>
+#include <unistd.h>
+#include <sys/types.h>
+#include <thread>
+
+//using namespace std;
+// this is object class saved in objectPool
+
+class connectObject
+{
+public:
+    connectObject(int ip, int port, int id):
+                ip_(ip),
+                port_(port),
+                id_(id)
+                {}
+    void run()
+    {
+        // TODO something with object
+        // for test 
+        std::cout << "thread:" << std::this_thread::get_id() << " get connect "<< id_ << std::endl;
+        sleep(1);
+    }
+
+    bool operator < (const connectObject &b) const
+    {
+        return id_ > b.id_;
+    }
+//private:
+    int ip_;
+    int port_;
+    int id_;
+};
+
+
+class objectPool
+{
+public:
+    static objectPool& instance()
+    {
+        static objectPool objPool_(5);
+        return objPool_;
+    }
+    std::shared_ptr<connectObject>accquireObject();  // here just for accquire a connectObject
+    void releaseObject(const std::shared_ptr<connectObject>obect);   // after user release obj
+    void interrupt();
+    
+    // for test
+    void prinfLength()
+    {
+        std::cout << "idleObjects length: " << idleObjects_.size() << "busyObjects_ length: " << busyObjects_.size() << std::endl; 
+    }
+private:
+    std::set<std::shared_ptr<connectObject> > idleObjects_;
+    std::set<std::shared_ptr<connectObject> > busyObjects_;
+    size_t objectCount_;
+    std::mutex mutex_;
+    bool interrupting_;     // switch for accquireTask
+    objectPool(size_t threadNum);
+};
+
+#endif
+
+// objectPool.cc
+#include "objectPool.h"
+#include <sys/types.h>
+#include <unistd.h>
+
+
+objectPool::objectPool(size_t threadNum = 4):
+                       objectCount_(threadNum)
+{} 
+std::shared_ptr<connectObject>objectPool::accquireObject()
+{
+    std::shared_ptr<connectObject>ret(nullptr);
+    interrupting_ = false;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!idleObjects_.empty())
+    {
+        ret = *(idleObjects_.begin());
+        idleObjects_.erase(ret);
+        busyObjects_.insert(ret);
+    }
+    else if (idleObjects_.size() + busyObjects_.size() < objectCount_)
+    {
+        static size_t connectFailedCount = 0;
+        try
+        {
+            // connect to db
+            static int i = 0;
+            i++;
+            ret = std::shared_ptr<connectObject>(new connectObject(1, 2,i));
+            busyObjects_.insert(ret);
+            connectFailedCount = 0;
+        }
+        catch(...)
+        {
+            connectFailedCount++;
+            // log
+            return nullptr;
+        }
+    }
+    // TO Do second get after some time using cond_timed_wait(lock,xxx)
+    // for test
+    return ret;
+}
+
+void objectPool::releaseObject(std::shared_ptr<connectObject> object)
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (busyObjects_.find(object) == busyObjects_.end())
+    {
+        // TODO log logic error
+    }
+    else
+    {
+        busyObjects_.erase(object);
+        idleObjects_.insert(object);
+    }
+    // May be cond_notify_one();
+}
+
+// main.cc
+#include <iostream>
+#include "objectPool.h"
+#include <thread>
+#include <sys/types.h>
+using namespace std;
+
+
+
+class Task
+{
+    public:
+    Task(std::shared_ptr<connectObject>obj):
+        connect_(obj)
+        {}
+    ~Task()
+    {
+        objectPool::instance().releaseObject(connect_);
+    }
+    void process()
+    {
+        connect_->run();
+    }
+    private:
+    std::shared_ptr<connectObject>connect_;
+};
+
+
+
+void thread_task()
+{
+    while(1)
+    {
+         auto  client = objectPool::instance().accquireObject();
+         if (nullptr == client)
+         {
+            std::cout << "no connect" << std::endl;
+            objectPool::instance().prinfLength();
+            sleep(1);
+            continue;
+         }
+         Task *task_ = new Task(client);
+         if (NULL==task_)
+         {
+            cout << "new failed" << endl;
+            return;
+         }
+         task_->process();
+         delete task_;
+         task_ = NULL;
+    }
+}
+int main()
+{
+   std::thread threads[8];
+    for (size_t i = 0; i < 8; i++)
+    {
+        threads[i] = std::thread(thread_task);
+    }
+    
+    for (auto &thread:threads)
+    {
+        thread.join();
+    }
+}
+
+
