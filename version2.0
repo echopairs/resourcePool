@@ -1,1 +1,256 @@
 
+#Makefile
+all:object
+CC=g++
+CPPFLAGS=-Wall -std=c++11 -g
+LDFLAGS=-pthread -lpthread
+object:objectPool.o main.o
+	$(CC) $(LDFLAGS) -o $@ $^
+objectPool.o:objectPool.cc
+	$(CC) $(CPPFLAGS) -c $<
+main.o:main.cc
+	$(CC) $(CPPFLAGS) -c $<
+.PHONY:
+	clean
+clean:
+	rm -rf *.o object
+
+#objectPool.h
+#ifndef OBJECT_POOL_H_
+#define OBJECT_POOL_H_
+
+#include <iostream>
+#include <string>
+#include <set>
+#include <vector>
+#include <memory>    // for shared_ptr
+#include <mutex>
+#include <unistd.h>
+#include <thread>
+#include <map>
+#include <list>
+
+// this is object class saved in objectPool
+class connectObject
+{
+public:
+    connectObject(int ip, int port, std::string id):
+                ip_(ip),
+                port_(port),
+                id_(id)
+                {}
+    void run()
+    {
+        // TODO something with object
+        // for test 
+      //  std::cout << "thread:" << std::this_thread::get_id() << " get connect "<< id_ << std::endl;
+        sleep(1);
+    }
+
+    bool operator < (const connectObject &b) const
+    {
+        return id_ > b.id_;
+    }
+//private:
+    int ip_;
+    int port_;
+    std::string id_;
+};
+
+
+using ObjectMapType = std::map<std::string, std::list<std::shared_ptr<connectObject>> >;
+class objectPool
+{
+public:
+    static objectPool& instance()
+    {
+        static objectPool objPool_(5);
+        return objPool_;
+    }
+
+    // we need input key to assign which type of handle or connect
+    // for connect,we me using ip+port as key
+    std::shared_ptr<connectObject>accquireObject(std::string code); 
+    void releaseObject(const std::shared_ptr<connectObject>object); // after user release obj
+    void interrupt();
+
+    // for test
+    void printfLength(std::string code)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        std::cout << "no connect code is: " << code << std::endl;
+        for(auto &it:idleObjects_)
+        {
+            std::cout << "idleObject:" << it.first << ":" << it.second.size() << std::endl;
+        }
+
+        for(auto &it:busyObjects_)
+        {
+            std::cout << "busyObject:" <<  it.first << ":" << it.second.size() << std::endl;
+        }
+    }
+private: 
+
+    std::mutex mutex_;
+    bool interrupting_;
+    objectPool(size_t threadNum);   //switch for accquireTask
+    ObjectMapType  idleObjects_;    
+    ObjectMapType  busyObjects_;
+    size_t objectCount_;           
+};
+
+#endif
+
+
+#objectPool.cc
+#include "objectPool.h"
+
+objectPool::objectPool(size_t threadNum = 4):
+                       objectCount_(threadNum)
+                       {
+                       }
+
+std::shared_ptr<connectObject>objectPool::accquireObject(std::string code)
+{
+    std::shared_ptr<connectObject>ret(nullptr);
+    interrupting_ = false;
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    auto it1 = idleObjects_.find(code);
+    auto it2 = busyObjects_.find(code);
+    
+    // code haved insert in idleMap
+    if (it1 != idleObjects_.end())
+    {
+        // have this code connect and have idle connect
+        if ((*it1).second.size() > 0)
+        {
+            ret = idleObjects_[code].front();
+            idleObjects_[code].erase(idleObjects_[code].begin());
+            busyObjects_[code].push_back(ret);
+            return ret;
+        }
+
+        // always true 
+        if (it2 != busyObjects_.end())
+        {
+            if ((*it1).second.size() + (*it2).second.size() < objectCount_)
+            {
+                ret = std::shared_ptr<connectObject>(new connectObject(1,2,code));
+                busyObjects_[code].push_back(ret);
+                return ret;
+            }
+        }
+    }
+     // now idleObject not have
+    else
+    {
+        // all this code connect is busy
+        if(it2 != busyObjects_.end() && (*it2).second.size() >= objectCount_)
+        {
+            // TODO log no connect for wait
+            return ret;
+        }
+        else
+        {
+            // add new type connect or add count
+            ret = std::shared_ptr<connectObject>(new connectObject(1,2,code));
+            busyObjects_[code].push_back(ret);
+            return ret;
+        }
+    }
+    return ret;
+}
+
+
+void objectPool::releaseObject(std::shared_ptr<connectObject>object)
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    // we may add judge for busyObjects
+    busyObjects_[object->id_].erase(busyObjects_[object->id_].begin());
+    idleObjects_[object->id_].push_back(object);
+}
+
+#main.cc
+
+#include <iostream>
+#include "objectPool.h"
+#include <thread>
+#include <sys/types.h>
+using namespace std;
+
+
+
+class Task
+{
+    public:
+    Task(std::shared_ptr<connectObject>obj):
+        connect_(obj)
+        {}
+    ~Task()
+    {
+        objectPool::instance().releaseObject(connect_);
+    }
+    void process()
+    {
+        connect_->run();
+    }
+    private:
+    std::shared_ptr<connectObject>connect_;
+};
+
+
+
+void thread_task()
+{
+    while(1)
+    {
+         std::string code;
+         static int i = 0;
+            
+         if (i%4 == 1)
+         code="code1";
+         else if(i%4==2)
+         code= "code2";
+         else if (i%4==3)
+         code="code3";
+         else
+         code="code4";
+         i++;
+         auto  client = objectPool::instance().accquireObject(code);
+         if (nullptr == client)
+         {
+            objectPool::instance().printfLength(code);
+            sleep(1);
+            continue;
+         }
+         Task *task_ = new Task(client);
+         if (NULL==task_)
+         {
+            cout << "new failed" << endl;
+            return;
+         }
+         task_->process();
+         delete task_;
+         task_ = NULL;
+    }
+}
+int main()
+{
+   std::thread threads[16];
+    for (size_t i = 0; i < 16; i++)
+    {
+        threads[i] = std::thread(thread_task);
+    }
+    
+    for (auto &thread:threads)
+    {
+        thread.join();
+    }
+}
+
+
+
+
+
+
